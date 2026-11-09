@@ -1,11 +1,15 @@
 """Deep Up — اختبار شامل: رابط ⇒ تنزيل على السيرفر ⇒ رفع إلى ميجا (محاكاة)."""
 import functools, http.server, json, os, socketserver, subprocess, sys, threading, time
 import httpx
+import main as server_mod   # لاختبار _resolve_url مباشرةً
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = "/tmp/deepup-fix"; os.makedirs(FIX, exist_ok=True)
 open(os.path.join(FIX, "محاضرة-الفيزياء.mp3"), "wb").write(b"A" * 300_000)
 open(os.path.join(FIX, "report.pdf"), "wb").write(b"%PDF-1.4\n" + b"B" * 120_000)
+# صفحة HTML تحاكي رابطًا يُرجع «عرض ويب» بدل الملف — يجب أن تُرفض بوضوح
+open(os.path.join(FIX, "page.html"), "w", encoding="utf-8").write(
+    "<!DOCTYPE html><html><head><title>معاينة</title></head><body>هذه صفحة ويب وليست ملفًا</body></html>")
 PS, PA, KEY = 9111, 9112, "deep-key"
 PF = 9113   # خادم "متقطّع" يفشل مرتين ثم يستجيب — لاختبار إعادة المحاولة
 
@@ -43,13 +47,23 @@ def main():
     api = subprocess.Popen([sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
                             "--port", str(PA), "--log-level", "warning"], cwd=HERE, env=env)
     base = f"http://127.0.0.1:{PA}"; H = {"X-Api-Key": KEY}
+
+    def wait_done(ids):
+        d = {}
+        for _ in range(300):
+            d = {j["id"]: j for j in httpx.get(base + "/jobs", headers=H).json()["jobs"]}
+            if all(i in d and d[i]["state"] in ("done", "error") for i in ids):
+                return d
+            time.sleep(0.2)
+        return d
+
     try:
         for _ in range(100):
             try:
                 if httpx.get(base + "/healthz", timeout=1).status_code == 200: break
             except Exception: time.sleep(0.2)
         print("· /healthz:", httpx.get(base + "/healthz").json())
-        assert httpx.get(base + "/healthz").json()["version"] == "1.1.0"
+        assert httpx.get(base + "/healthz").json()["version"] == "1.1.1"
         print("· /diag:", {k: v for k, v in httpx.get(base + "/diag", headers=H).json().items()
                            if k in ("version", "rsa", "sessions", "keys")})
         assert httpx.post(base + "/jobs", json={"url": "https://x/y"}).status_code == 401
@@ -93,6 +107,28 @@ def main():
             assert j["link"].startswith("https://mega.nz/file/"), j["link"]
             assert j["total"] > 0 and j["percent"] == 100
         assert d[j1["id"]]["filename"].startswith("محاضرة-الفيزياء"), d[j1["id"]]["filename"]
+        # ── حل الروابط إلى تحميل مباشر (وحدة) ──
+        assert "drive.usercontent.google.com" in server_mod._resolve_url("https://drive.google.com/file/d/1AbC_xYz-123/view?usp=sharing")
+        assert "id=1AbC_xYz-123" in server_mod._resolve_url("https://drive.google.com/file/d/1AbC_xYz-123/view?usp=sharing")
+        assert "id=ABC123" in server_mod._resolve_url("https://drive.google.com/open?id=ABC123")
+        assert "dl=1" in server_mod._resolve_url("https://www.dropbox.com/s/abc/file.zip?dl=0")
+        assert server_mod._resolve_url("http://127.0.0.1:9111/report.pdf").endswith("/report.pdf")
+        print("✓ _resolve_url: Drive → رابط مباشر · Dropbox → dl=1")
+
+        # ── حظر رفع صفحات HTML بدل الملفات (تكاملي) ──
+        files_before = len([n for n in httpx.get(base + "/_fake/store", headers=H).json()["nodes"].values()
+                            if n["type"] == "file"])
+        hj = httpx.post(base + "/jobs", headers=H, timeout=30,
+                        json={"url": f"http://127.0.0.1:{PS}/page.html",
+                              "session_id": sid, "folder": "Deep Up HTML"}).json()
+        d3 = wait_done([hj["id"]])
+        assert d3[hj["id"]]["state"] == "error", d3[hj["id"]]
+        assert "HTML" in d3[hj["id"]]["error"], d3[hj["id"]]["error"]
+        files_after = len([n for n in httpx.get(base + "/_fake/store", headers=H).json()["nodes"].values()
+                           if n["type"] == "file"])
+        assert files_after == files_before, "صفحة HTML حُمّلت ورُفعت كملف!"
+        print("✓ صفحات HTML تُرفض برسالة واضحة ولا تُرفع إلى ميجا إطلاقًا")
+
         print("✓ كل مهمة: نُزّلت على السيرفر ثم رُفعت إلى مجلد Deep Up على ميجا")
 
         # ── /jobs/batch: دفعة روابط (صالح + مكرر + ftp مرفوض) ──
@@ -113,17 +149,6 @@ def main():
                         json={"url": f"http://127.0.0.1:{PF}/flaky.bin",
                               "session_id": sid, "folder": "Deep Up Retry"}).json()
         print("✓ أُنشئت مهمة إعادة المحاولة:", rj["id"])
-
-        def wait_done(ids):
-            d = {}
-            for _ in range(300):
-                d = {j["id"]: j for j in httpx.get(base + "/jobs", headers=H).json()["jobs"]}
-                if all(d[i]["state"] in ("done", "error") for i in ids if i in d) and \
-                   all(i in d for i in ids):
-                    if all(d[i]["state"] in ("done", "error") for i in ids):
-                        return d
-                time.sleep(0.2)
-            return d
 
         batch_ids = [j["id"] for j in fb["created"]]
         d2 = wait_done(batch_ids + [rj["id"]])

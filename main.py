@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse, parse_qs, urlencode
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 import mega_up
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 WORK = os.environ.get("WORK_DIR") or "/tmp/deepup"
 os.makedirs(WORK, exist_ok=True)
 MAX_MB = int(os.environ.get("MAX_FILE_MB", "2048"))
@@ -223,16 +223,67 @@ def _safe_url(url: str) -> None:
         raise HTTPException(400, "IPv6 غير مسموح")
 
 
+# ─────────────────── حل روابط المشاركة الشائعة إلى روابط تحميل مباشرة ───────────────────
+_CTYPE_EXT = {
+    "application/pdf": ".pdf",
+    "application/zip": ".zip", "application/x-zip-compressed": ".zip",
+    "application/x-7z-compressed": ".7z", "application/x-rar-compressed": ".rar",
+    "application/gzip": ".gz", "application/x-tar": ".tar",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/wav": ".wav", "audio/ogg": ".ogg", "audio/flac": ".flac",
+    "video/mp4": ".mp4", "video/webm": ".webm", "video/x-matroska": ".mkv", "video/quicktime": ".mov",
+    "application/json": ".json", "text/plain": ".txt", "text/csv": ".csv",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+}
+
+
+def _resolve_url(url: str) -> str:
+    """يحوّل روابط «صفحة المعاينة» الشائعة إلى روابط تحميل مباشرة.
+
+    مثال Google Drive: رابط /file/.../view هو صفحة عرض وليس الملف — ننتقل
+    إلى endpoint التحميل المباشر. Dropbox: dl=0 صفحة معاينة؛ dl=1 يحمّل الملف.
+    """
+    try:
+        u = urlparse(url)
+    except Exception:
+        return url
+    host = (u.hostname or "").lower()
+    q = parse_qs(u.query)
+    # Google Drive
+    m = re.search(r"/file/d/([A-Za-z0-9_-]+)", u.path)
+    if m and "google" in host:
+        return f"https://drive.usercontent.google.com/download?id={m.group(1)}&export=download&confirm=t"
+    if "drive.google" in host and u.path in ("/open", "/uc") and q.get("id"):
+        return f"https://drive.usercontent.google.com/download?id={q['id'][0]}&export=download&confirm=t"
+    # Dropbox
+    if "dropbox.com" in host:
+        q["dl"] = ["1"]
+        return urlunparse(u._replace(query=urlencode(q, doseq=True)))
+    return url
+
+
 def _guess_name(url: str, cd: str, ct: str) -> str:
+    name = ""
     if cd:
         m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I)
         if m:
-            return _clean(unquote(m.group(1)))
-        m = re.search(r'filename="?([^";]+)"?', cd, re.I)
-        if m:
-            return _clean(m.group(1))
-    name = unquote(os.path.basename(urlparse(url).path)) or "file"
-    return _clean(name)
+            name = unquote(m.group(1))
+        else:
+            m = re.search(r'filename="?([^";]+)"?', cd, re.I)
+            if m:
+                name = m.group(1)
+    if not name:
+        name = unquote(os.path.basename(urlparse(url).path)) or "file"
+    name = _clean(name)
+    if "." not in name:
+        ext = _CTYPE_EXT.get((ct or "").split(";")[0].strip().lower())
+        if ext:
+            name = _clean(name + ext)
+    return name
 
 
 def _clean(name: str) -> str:
@@ -247,22 +298,36 @@ def _download(job: Job) -> str:
     job.state = "downloading"
     job.stage = "جارٍ التنزيل من الرابط"
     job.percent = 0
+    final_url = _resolve_url(job.url)
+    if final_url != job.url:
+        job.stage = "حُلّ الرابط إلى تحميل مباشر — جارٍ التنزيل"
     try:
         with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30, read=120),
                           headers={"User-Agent": USER_AGENT}) as c:
-            with c.stream("GET", job.url) as r:
+            with c.stream("GET", final_url) as r:
                 if r.status_code >= 400:
                     if r.status_code in (408, 429) or r.status_code >= 500:
                         raise TransientError(f"الرابط رد {r.status_code}")
                     raise RuntimeError(f"الرابط رد {r.status_code}")
-                job.filename = job.filename or _guess_name(job.url, r.headers.get("content-disposition", ""),
+                # روابط الصفحات (Google Drive القديم / Dropbox dl=0 / صفحات معطوبة)
+                # تُرجع HTML وليست ملفًا — نرفضها برسالة واضحة بدل رفع ملف تافه
+                ctype = (r.headers.get("content-type") or "").lower()
+                if "text/html" in ctype:
+                    raise RuntimeError("الرابط أرجع صفحة ويب (HTML) وليست ملفًا — استخدم رابط «تحميل مباشر» للملف")
+                job.filename = job.filename or _guess_name(final_url, r.headers.get("content-disposition", ""),
                                                            r.headers.get("content-type", ""))
                 job.total = int(r.headers.get("content-length") or 0)
                 if job.total > MAX_MB * 1048576:
                     raise RuntimeError(f"الحجم يتجاوز الحد ({MAX_MB} م.ب)")
                 got = 0
+                first = True
                 with open(path, "wb") as fh:
                     for chunk in r.iter_bytes(1 << 16):
+                        if first:
+                            head = chunk[:512].lstrip().lower()
+                            if head.startswith((b"<!doctype html", b"<html")):
+                                raise RuntimeError("الرابط أرجع صفحة ويب (HTML) وليست ملفًا — استخدم رابط «تحميل مباشر» للملف")
+                            first = False
                         fh.write(chunk)
                         got += len(chunk)
                         job.got = got
