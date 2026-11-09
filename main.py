@@ -34,8 +34,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import mega_up
+import telegram_up
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 WORK = os.environ.get("WORK_DIR") or "/tmp/deepup"
 os.makedirs(WORK, exist_ok=True)
 MAX_MB = int(os.environ.get("MAX_FILE_MB", "2048"))
@@ -111,6 +112,8 @@ class Job:
     attempts: int = 0              # كم محاولة تنزيل استهلكت (1 = من أول مرة)
     smart: bool = False            # «حل ذكي ✨» — استخراج رابط التحميل من صفحة الويب
     resolved_from: str = ""        # من أين حُلّ الرابط (لعرض شفافية في التطبيق)
+    tg_sid: str = ""               # جلسة تيليجرام (إن طُلب رفع نسخة للبوت)
+    tg: dict[str, Any] = field(default_factory=dict)   # نتيجة الرفع للتيليجرام (state/message_id/error)
 
     def dict(self) -> dict[str, Any]:
         return {"id": self.id, "filename": self.filename, "state": self.state,
@@ -118,7 +121,8 @@ class Job:
                 "got": self.got, "link": self.link, "error": self.error,
                 "created": int(self.created), "seconds": self.seconds,
                 "url": self.url, "folder": self.folder, "attempts": self.attempts,
-                "resolved_from": self.resolved_from, "smart": self.smart}
+                "resolved_from": self.resolved_from, "smart": self.smart,
+                "tg": self.tg or {"state": "none"}}
 
 
 JOBS: dict[str, Job] = {}
@@ -158,7 +162,10 @@ def diag(owner: str = Depends(auth)) -> dict:
     return {"version": VERSION, "mega_lib": mega_up.info(),
             "rsa": mega_up.rsa_available(), "sessions": mega_up.live_sessions(),
             "keys": len(KEYS), "jobs": len(JOBS), "work_dir": WORK,
-            "max_file_mb": MAX_MB, "folder": mega_up.FOLDER}
+            "max_file_mb": MAX_MB, "folder": mega_up.FOLDER,
+            "telegram": {"sessions": telegram_up.live_sessions(),
+                         "max_mb": telegram_up.MAX_TG_MB,
+                         "fake": telegram_up.FAKE}}
 
 
 class SealedReq(BaseModel):
@@ -170,6 +177,7 @@ class JobReq(BaseModel):
     session_id: str = ""
     folder: str = ""
     smart: bool = False
+    tg_session_id: str = ""       # إن وُجدت جلسة تيليجرام، تُرسل نسخة من الملف للبوت أيضًا
 
 
 class BatchReq(BaseModel):
@@ -177,6 +185,7 @@ class BatchReq(BaseModel):
     session_id: str = ""
     folder: str = ""
     smart: bool = False
+    tg_session_id: str = ""       # نفس الرمز — كل مهمة في الدفعة تُرفق بتيليجرام
 
 
 @app.get("/mega/key")
@@ -213,6 +222,41 @@ def mega_session_state(sid: str, owner: str = Depends(auth)) -> dict:
 @app.delete("/mega/session/{sid}")
 def mega_session_drop(sid: str, owner: str = Depends(auth)) -> dict:
     return {"closed": mega_up.drop_session(sid)}
+
+
+# ─────────────────── تيليجرام: ربط البوت (جلسة مشفّرة في الذاكرة، مثل ميجا) ───────────────────
+def _gate_tg_session(owner: str) -> None:
+    _ = owner
+
+
+@app.post("/telegram/session")
+def telegram_session_create(req: SealedReq, owner: str = Depends(auth)) -> dict:
+    if not mega_up.rsa_available():
+        raise HTTPException(500, "وحدة التشفير غير متاحة على السيرفر")
+    try:
+        token, chat_id = mega_up.open_sealed(req.sealed)
+    except Exception as e:                                   # noqa: BLE001
+        raise HTTPException(400, "تعذّر فك الظرف المشفّر — حدّث التطبيق وحاول مجددًا") from e
+    try:
+        sid, info = telegram_up.create_session(token, chat_id)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:                                   # noqa: BLE001
+        raise HTTPException(400, f"فشل ربط البوت: {type(e).__name__}: {e}"[:200]) from e
+    return {"session_id": sid, "bot": info["bot"],
+            "chat": telegram_up.mask_chat(chat_id),
+            "chat_title": info["chat_title"],
+            "expires_in_sec": telegram_up.SESS_TTL}
+
+
+@app.get("/telegram/session/{sid}")
+def telegram_session_state(sid: str, owner: str = Depends(auth)) -> dict:
+    return telegram_up.public_info(sid)
+
+
+@app.delete("/telegram/session/{sid}")
+def telegram_session_drop(sid: str, owner: str = Depends(auth)) -> dict:
+    return {"closed": telegram_up.drop_session(sid)}
 
 
 def _host_is_public(host: str) -> bool:
@@ -631,7 +675,8 @@ def _worker(job: Job) -> None:
         job.percent = 0
         job.stage = "جارٍ الرفع إلى MEGA"
         sess = mega_up.session(job.sid) if job.sid else None
-        if sess is None and not mega_up.enabled():
+        mega_attempted = sess is not None or mega_up.enabled()
+        if sess is None and not mega_attempted and not job.tg_sid:
             raise RuntimeError("انتهت جلسة MEGA — سجّل الدخول من جديد")
 
         def on_state(**kw: Any) -> None:
@@ -642,14 +687,35 @@ def _worker(job: Job) -> None:
 
         if sess is not None:
             job.link = mega_up.upload_with(sess["client"], path, job.filename, job.folder, on_state) or ""
-        else:
+        elif mega_up.enabled():
             # وضع بدون جلسة (MEGA_EMAIL/MEGA_PASSWORD): رفع متزامن بنفس توقيع on_state
             job.link = mega_up.upload_file(None, path, job.filename, job.folder, on_state) or ""
-        if not job.link:
+        else:
+            job.link = ""          # لا جلسة ميجا ولا وضع بيئة — تيليجرام وحده
+            job.stage = "تخطّي ميجا (لا جلسة) — تكملة رفع تيليجرام…"
+        if not job.link and mega_attempted:
             job.link = mega_up.last_link()
+        # ── تيليجرام: وجهة إضافية (اختيارية) ──
+        if job.tg_sid:
+            tg_sess = telegram_up.session(job.tg_sid)
+            if tg_sess is None:
+                job.tg = {"state": "failed", "error": "انتهت جلسة تيليجرام — اربط البوت من جديد"}
+            else:
+                try:
+                    job.stage = "جارٍ الرفع إلى تيليجرام…"
+                    res = telegram_up.send_document(tg_sess, path, job.filename)
+                    job.tg = {"state": "sent", "message_id": res.get("message_id"),
+                              "chat_id": res.get("chat_id"), "bot": res.get("bot")}
+                except Exception as e:                        # noqa: BLE001
+                    job.tg = {"state": "failed",
+                              "error": f"{type(e).__name__}: {e}"[:200]}
         job.state = "done"
         job.percent = 100
-        job.stage = "تم الرفع ✓"
+        if not job.link and job.tg_sid:
+            job.stage = ("تم الرفع إلى تيليجرام ✓" if job.tg.get("state") == "sent"
+                         else "انتهت المهمة — راجع نتيجة تيليجرام")
+        else:
+            job.stage = "تم الرفع ✓"
     except Exception as e:                                    # noqa: BLE001
         job.state = "error"
         job.error = f"{type(e).__name__}: {e}"[:300]
@@ -663,13 +729,15 @@ def _worker(job: Job) -> None:
             pass
 
 
-def _make_job(owner: str, url: str, sid: str, folder: str, smart: bool = False) -> Optional[Job]:
+def _make_job(owner: str, url: str, sid: str, folder: str, smart: bool = False,
+               tg_sid: str = "") -> Optional[Job]:
     """ينشئ مهمة ويشغّلها في Thread — يعيد None لو بلغنا الحد الأقصى للمهام."""
     folder = (folder or "").strip() or mega_up.FOLDER
     with LOCK:
         if len(JOBS) >= MAX_JOBS:
             return None
-        job = Job(id=uuid.uuid4().hex[:12], owner=owner, url=url, sid=sid, folder=folder, smart=bool(smart))
+        job = Job(id=uuid.uuid4().hex[:12], owner=owner, url=url, sid=sid, folder=folder,
+                  smart=bool(smart), tg_sid=(tg_sid or "").strip())
         JOBS[job.id] = job
     threading.Thread(target=_worker, args=(job,), name="deepup-" + job.id, daemon=True).start()
     return job
@@ -679,7 +747,7 @@ def _make_job(owner: str, url: str, sid: str, folder: str, smart: bool = False) 
 def create_job(req: JobReq, owner: str = Depends(auth)) -> dict:
     _gc()
     _safe_url(req.url.strip())
-    job = _make_job(owner, req.url.strip(), req.session_id, req.folder, req.smart)
+    job = _make_job(owner, req.url.strip(), req.session_id, req.folder, req.smart, req.tg_session_id)
     if job is None:
         raise HTTPException(429, "عدد المهام كبير — انتظر قليلًا أو احذف مهامًا قديمة")
     return job.dict()
@@ -714,7 +782,7 @@ def create_batch(req: BatchReq, owner: str = Depends(auth)) -> dict:
         except HTTPException as e:
             rejected.append({"url": u, "reason": str(e.detail)})
             continue
-        job = _make_job(owner, u, req.session_id, req.folder, req.smart)
+        job = _make_job(owner, u, req.session_id, req.folder, req.smart, req.tg_session_id)
         if job is None:
             rejected.append({"url": u, "reason": "بلغت الحد الأقصى للمهام المتزامنة"})
             continue

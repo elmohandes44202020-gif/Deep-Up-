@@ -51,7 +51,7 @@ def main():
     srv = serve()
     flaky = serve_flaky()
     env = {**os.environ, "API_KEYS": f"me:{KEY}", "WORK_DIR": "/tmp/deepup-work",
-           "ALLOW_PRIVATE_HOSTS": "1", "DEEPUP_FAKE_MEGA": "1", "MAX_FILE_MB": "50"}
+           "ALLOW_PRIVATE_HOSTS": "1", "DEEPUP_FAKE_MEGA": "1", "DEEPUP_FAKE_TELEGRAM": "1", "MAX_FILE_MB": "50"}
     api = subprocess.Popen([sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
                             "--port", str(PA), "--log-level", "warning"], cwd=HERE, env=env)
     base = f"http://127.0.0.1:{PA}"; H = {"X-Api-Key": KEY}
@@ -71,7 +71,7 @@ def main():
                 if httpx.get(base + "/healthz", timeout=1).status_code == 200: break
             except Exception: time.sleep(0.2)
         print("· /healthz:", httpx.get(base + "/healthz").json())
-        assert httpx.get(base + "/healthz").json()["version"] == "1.2.0"
+        assert httpx.get(base + "/healthz").json()["version"] == "1.3.0"
         print("· /diag:", {k: v for k, v in httpx.get(base + "/diag", headers=H).json().items()
                            if k in ("version", "rsa", "sessions", "keys")})
         assert httpx.post(base + "/jobs", json={"url": "https://x/y"}).status_code == 401
@@ -92,13 +92,22 @@ def main():
         assert r.status_code == 200, r.text
         sid = r.json()["session_id"]
 
+        # ربط بوت تيليجرام (محاكاة) — الجلسة على السيرفر بمفتاح RSA نفسه
+        sealed_tg = base64.b64encode(PKCS1_OAEP.new(pubkey).encrypt(
+            "123456:FAKE_TOKEN\n-100999888".encode("utf-8"))).decode()
+        rt = httpx.post(base + "/telegram/session", headers=H, json={"sealed": sealed_tg}, timeout=10)
+        print("✓ /telegram/session →", rt.status_code, {kk: rt.json().get(kk) for kk in ("bot", "chat_title")})
+        assert rt.status_code == 200, rt.text
+        assert rt.json()["bot"] == "deepup_test_bot"
+        tg_sid = rt.json()["session_id"]
+
         # رابط ملف صوتي
         j1 = httpx.post(base + "/jobs", headers=H, timeout=30,
                         json={"url": f"http://127.0.0.1:{PS}/%D9%85%D8%AD%D8%A7%D8%B6%D8%B1%D8%A9-%D8%A7%D9%84%D9%81%D9%8A%D8%B2%D9%8A%D8%A7%D8%A1.mp3",
-                              "session_id": sid}).json()
+                              "session_id": sid, "tg_session_id": tg_sid}).json()
         # رابط مستند
         j2 = httpx.post(base + "/jobs", headers=H, timeout=30,
-                        json={"url": f"http://127.0.0.1:{PS}/report.pdf", "session_id": sid}).json()
+                        json={"url": f"http://127.0.0.1:{PS}/report.pdf", "session_id": sid, "tg_session_id": tg_sid}).json()
         print("✓ أُنشئت مهمتان:", j1["id"], j2["id"])
 
         stages = {}
@@ -114,6 +123,8 @@ def main():
             assert j["state"] == "done", j
             assert j["link"].startswith("https://mega.nz/file/"), j["link"]
             assert j["total"] > 0 and j["percent"] == 100
+            assert j["tg"]["state"] == "sent", j          # نسخة تيليجرام وصلت البوت أيضًا
+            assert j["tg"]["message_id"], j
         assert d[j1["id"]]["filename"].startswith("محاضرة-الفيزياء"), d[j1["id"]]["filename"]
         # ── حل الروابط إلى تحميل مباشر (وحدة) ──
         assert "drive.usercontent.google.com" in server_mod._resolve_url("https://drive.google.com/file/d/1AbC_xYz-123/view?usp=sharing")
@@ -174,6 +185,31 @@ def main():
         print("✓ بدون «حل ذكي»: السلوك القديم كما هو (خطأ HTML واضح)")
 
         print("✓ كل مهمة: نُزّلت على السيرفر ثم رُفعت إلى مجلد Deep Up على ميجا")
+
+        # ── مهمة «تيليغرام فقط»: بلا جلسة ميجا تُرفع للبوت وحده ──
+        tgonly = httpx.post(base + "/jobs", headers=H, timeout=30,
+                            json={"url": f"http://127.0.0.1:{PS}/report.pdf",
+                                  "tg_session_id": tg_sid, "folder": "Deep Up TG"}).json()
+        d8 = wait_done([tgonly["id"]])
+        assert d8[tgonly["id"]]["state"] == "done", d8[tgonly["id"]]
+        assert d8[tgonly["id"]]["link"] == "", d8[tgonly["id"]]          # لا ميجا = لا رابط ميجا (لا رابط قديم مسروق)
+        assert d8[tgonly["id"]]["tg"]["state"] == "sent", d8[tgonly["id"]]
+        assert "تيليجرام" in d8[tgonly["id"]]["stage"], d8[tgonly["id"]]["stage"]
+        print("✓ مهمة «تيليغرام فقط» (بلا جلسة ميجا): أُرفقت في البوت —", d8[tgonly["id"]]["stage"])
+
+        # ── جلسة تيليجرام غير صالحة: ميجا تنجح والمهمة تكتمل مع تحذير تيليجرام ──
+        badjob = httpx.post(base + "/jobs", headers=H, timeout=30,
+                            json={"url": f"http://127.0.0.1:{PS}/report.pdf",
+                                  "session_id": sid, "tg_session_id": "جلسة-غير-موجودة",
+                                  "folder": "Deep Up TG bad"}).json()
+        d9 = wait_done([badjob["id"]])
+        assert d9[badjob["id"]]["state"] == "done", d9[badjob["id"]]
+        assert d9[badjob["id"]]["tg"]["state"] == "failed", d9[badjob["id"]]
+        assert "تيليجرام" in d9[badjob["id"]]["tg"]["error"], d9[badjob["id"]]["tg"]
+        print("✓ جلسة تيليجرام ميتة: ميجا اكتملت والمهمة تذكر فشل تيليجرام بوضوح")
+
+        # حذف جلسة تيليجرام
+        print("✓ حذف جلسة تيليجرام:", httpx.delete(f"{base}/telegram/session/{tg_sid}", headers=H).json())
 
         # ── /jobs/batch: دفعة روابط (صالح + مكرر + ftp مرفوض) ──
         fb = httpx.post(base + "/jobs/batch", headers=H, timeout=30, json={
