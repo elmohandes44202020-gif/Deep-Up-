@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 pydantic>=2
 pycryptodome>=3.19
+beautifulsoup4>=4.12

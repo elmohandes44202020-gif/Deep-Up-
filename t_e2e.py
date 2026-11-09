@@ -10,6 +10,14 @@ open(os.path.join(FIX, "report.pdf"), "wb").write(b"%PDF-1.4\n" + b"B" * 120_000
 # صفحة HTML تحاكي رابطًا يُرجع «عرض ويب» بدل الملف — يجب أن تُرفض بوضوح
 open(os.path.join(FIX, "page.html"), "w", encoding="utf-8").write(
     "<!DOCTYPE html><html><head><title>معاينة</title></head><body>هذه صفحة ويب وليست ملفًا</body></html>")
+# صفحة «حل ذكي»: رابط تحميل مباشر داخل صفحة HTML
+open(os.path.join(FIX, "page-with-dl.html"), "w", encoding="utf-8").write(
+    '<!DOCTYPE html><html><body><h1>الملف</h1>'
+    '<a href="%D9%85%D8%AD%D8%A7%D8%B6%D8%B1%D8%A9-%D8%A7%D9%84%D9%81%D9%8A%D8%B2%D9%8A%D8%A7%D8%A1.mp3">⬇ تحميل مباشر</a>'
+    "</body></html>")
+# صفحة بلا أي رابط تحميل — يجب أن يفشل الحل الذكي برسالة واضحة
+open(os.path.join(FIX, "page-no-dl.html"), "w", encoding="utf-8").write(
+    "<!DOCTYPE html><html><body><p>لا يوجد هنا أي رابط ملف</p></body></html>")
 PS, PA, KEY = 9111, 9112, "deep-key"
 PF = 9113   # خادم "متقطّع" يفشل مرتين ثم يستجيب — لاختبار إعادة المحاولة
 
@@ -63,7 +71,7 @@ def main():
                 if httpx.get(base + "/healthz", timeout=1).status_code == 200: break
             except Exception: time.sleep(0.2)
         print("· /healthz:", httpx.get(base + "/healthz").json())
-        assert httpx.get(base + "/healthz").json()["version"] == "1.1.1"
+        assert httpx.get(base + "/healthz").json()["version"] == "1.2.0"
         print("· /diag:", {k: v for k, v in httpx.get(base + "/diag", headers=H).json().items()
                            if k in ("version", "rsa", "sessions", "keys")})
         assert httpx.post(base + "/jobs", json={"url": "https://x/y"}).status_code == 401
@@ -128,6 +136,42 @@ def main():
                            if n["type"] == "file"])
         assert files_after == files_before, "صفحة HTML حُمّلت ورُفعت كملف!"
         print("✓ صفحات HTML تُرفض برسالة واضحة ولا تُرفع إلى ميجا إطلاقًا")
+
+        # ── رابط mega.nz عام (محاكاة) — يعمل بلا أي تغيير في التطبيق ──
+        mj = httpx.post(base + "/jobs", headers=H, timeout=30,
+                        json={"url": "https://mega.nz/file/abc123handle#AAAAAAAAAAAAAAAAAAAAAA",
+                              "session_id": sid, "folder": "Deep Up Mega"}).json()
+        d4 = wait_done([mj["id"]])
+        assert d4[mj["id"]]["state"] == "done", d4[mj["id"]]
+        assert d4[mj["id"]]["total"] == 262144, d4[mj["id"]]          # حجم الملف المحاكى
+        assert d4[mj["id"]]["filename"] == "ملف-اختبار-ميجا.zip", d4[mj["id"]]["filename"]
+        assert d4[mj["id"]]["link"].startswith("https://mega.nz/file/")
+        print("✓ رابط mega.nz العام: نُزّل بلا حساب ورُفع — الاسم:", d4[mj["id"]]["filename"])
+
+        # ── «حل ذكي ✨» اختياري: صفحة بها رابط تحميل ──
+        sj = httpx.post(base + "/jobs", headers=H, timeout=30,
+                        json={"url": f"http://127.0.0.1:{PS}/page-with-dl.html",
+                              "session_id": sid, "smart": True, "folder": "Deep Up Smart"}).json()
+        d5 = wait_done([sj["id"]])
+        assert d5[sj["id"]]["state"] == "done", d5[sj["id"]]
+        assert d5[sj["id"]]["filename"].startswith("محاضرة-الفيزياء"), d5[sj["id"]]["filename"]
+        assert d5[sj["id"]]["resolved_from"].endswith("page-with-dl.html")
+        print("✓ الحل الذكي: وُجد رابط التحميل داخل الصفحة ورُفع:", d5[sj["id"]]["filename"])
+
+        # صفحة بلا روابط + حل ذكي ⇒ خطأ واضح
+        nj = httpx.post(base + "/jobs", headers=H, timeout=30,
+                        json={"url": f"http://127.0.0.1:{PS}/page-no-dl.html",
+                              "session_id": sid, "smart": True}).json()
+        d6 = wait_done([nj["id"]])
+        assert d6[nj["id"]]["state"] == "error" and "رابط تحميل" in d6[nj["id"]]["error"], d6[nj["id"]]
+        print("✓ الحل الذكي: صفحة بلا روابط تحميل ⇒ خطأ واضح دون رفع أي شيء")
+
+        # نفس الصفحة بدون تفعيل الحل الذكي ⇒ رسالة HTML المعتادة
+        bj = httpx.post(base + "/jobs", headers=H, timeout=30,
+                        json={"url": f"http://127.0.0.1:{PS}/page-with-dl.html", "session_id": sid}).json()
+        d7 = wait_done([bj["id"]])
+        assert d7[bj["id"]]["state"] == "error" and "HTML" in d7[bj["id"]]["error"], d7[bj["id"]]
+        print("✓ بدون «حل ذكي»: السلوك القديم كما هو (خطأ HTML واضح)")
 
         print("✓ كل مهمة: نُزّلت على السيرفر ثم رُفعت إلى مجلد Deep Up على ميجا")
 

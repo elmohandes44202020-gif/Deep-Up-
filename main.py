@@ -12,17 +12,21 @@
 from __future__ import annotations
 
 import base64
+import glob
+import ipaddress
+import socket
 import hashlib
 import json
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from urllib.parse import unquote, urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import unquote, urlparse, urlunparse, parse_qs, urlencode, urljoin
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -31,7 +35,7 @@ from pydantic import BaseModel
 
 import mega_up
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 WORK = os.environ.get("WORK_DIR") or "/tmp/deepup"
 os.makedirs(WORK, exist_ok=True)
 MAX_MB = int(os.environ.get("MAX_FILE_MB", "2048"))
@@ -105,13 +109,16 @@ class Job:
     seconds: float = 0.0
     sid: str = ""
     attempts: int = 0              # كم محاولة تنزيل استهلكت (1 = من أول مرة)
+    smart: bool = False            # «حل ذكي ✨» — استخراج رابط التحميل من صفحة الويب
+    resolved_from: str = ""        # من أين حُلّ الرابط (لعرض شفافية في التطبيق)
 
     def dict(self) -> dict[str, Any]:
         return {"id": self.id, "filename": self.filename, "state": self.state,
                 "stage": self.stage, "percent": self.percent, "total": self.total,
                 "got": self.got, "link": self.link, "error": self.error,
                 "created": int(self.created), "seconds": self.seconds,
-                "url": self.url, "folder": self.folder, "attempts": self.attempts}
+                "url": self.url, "folder": self.folder, "attempts": self.attempts,
+                "resolved_from": self.resolved_from, "smart": self.smart}
 
 
 JOBS: dict[str, Job] = {}
@@ -162,12 +169,14 @@ class JobReq(BaseModel):
     url: str
     session_id: str = ""
     folder: str = ""
+    smart: bool = False
 
 
 class BatchReq(BaseModel):
     urls: list[str]
     session_id: str = ""
     folder: str = ""
+    smart: bool = False
 
 
 @app.get("/mega/key")
@@ -206,21 +215,45 @@ def mega_session_drop(sid: str, owner: str = Depends(auth)) -> dict:
     return {"closed": mega_up.drop_session(sid)}
 
 
+def _host_is_public(host: str) -> bool:
+    """True إذا كان المضيف عامًا (ليس عنوانًا محليًا/داخليًا) — يُستخدم في SSRF والحل الذكي.
+
+    يجمّد كل صيغ IPv4 (عشرية/ست عشرية/ثماني مدمجة عبر inet_aton) والمدى
+    CGNAT وlink-local (علامة سحابة 169.254.169.254) — ثم يعوّل على is_global.
+    ملاحظة صادقة: هجمات «DNS rebinding» (اسم يحل إلى عنوان داخلي) لا يمكن
+    إسقاطها كليًا دون الاتصال نفسه — لا تُفتح بها ثغرة لكنها ليست محلولة هنا.
+    """
+    if ALLOW_PRIVATE:
+        return True
+    host = (host or "").strip().lower().strip(".")
+    if not host:
+        return False
+    if host.startswith("[") or ":" in host:      # IPv6 — غير مسموح في هذه الأداة
+        return False
+    if host == "localhost" or host.endswith((".local", ".internal", ".lan", ".home")):
+        return False
+    ip = None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ip = ipaddress.ip_address(socket.inet_aton(host))   # http://2130706433/ = 127.0.0.1
+        except (OSError, ValueError):
+            ip = None
+    if ip is not None:
+        return bool(ip.is_global)
+    return True
+
+
 def _safe_url(url: str) -> None:
     u = urlparse(url)
     if u.scheme not in ("http", "https") or not u.netloc:
         raise HTTPException(400, "الرابط يجب أن يبدأ بـ http أو https")
     host = (u.hostname or "").lower()
-    if ALLOW_PRIVATE:
-        return
-    if host in ("localhost", "0.0.0.0") or host.endswith(".local"):
-        raise HTTPException(400, "عنوان محلي غير مسموح")
-    if re.fullmatch(r"(127|10|192\.168|169\.254)\.\d+\.\d+\.\d+", host):
+    if not _host_is_public(host):
+        if host in ("localhost", "0.0.0.0") or host.endswith(".local"):
+            raise HTTPException(400, "عنوان محلي غير مسموح")
         raise HTTPException(400, "عنوان شبكة داخلية غير مسموح")
-    if re.fullmatch(r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+", host):
-        raise HTTPException(400, "عنوان شبكة داخلية غير مسموح")
-    if host.startswith("[") or ":" in host:
-        raise HTTPException(400, "IPv6 غير مسموح")
 
 
 # ─────────────────── حل روابط المشاركة الشائعة إلى روابط تحميل مباشرة ───────────────────
@@ -266,6 +299,177 @@ def _resolve_url(url: str) -> str:
     return url
 
 
+# ─────────────────── روابط mega.nz العامة (المفتاح داخل الرابط) ───────────────────
+def _is_mega_link(url: str) -> bool:
+    try:
+        u = urlparse(url or "")
+    except Exception:
+        return False
+    host = (u.hostname or "").lower()
+    return host.endswith("mega.nz") or host.endswith("mega.co.nz")
+
+
+def _fix_mega_name(name: str) -> str:
+    """أسماء ملفات ميجا غالبًا UTF-8 فُكّت كـ latin-1 — نصححها بأفضل جهد."""
+    if not name:
+        return "mega-file"
+    try:
+        return _clean(name.encode("latin-1").decode("utf-8"))
+    except Exception:
+        return _clean(name)
+
+
+def _mega_public_download(job: Job) -> str:
+    """ينزّل ملفًا من رابط mega.nz عام إلى WORK/{id}.bin.
+
+    ميجا تُشفّر الملفات بمفتاح مرفق داخل fragment (#...) — لذا يمكن تنزيلها وفكها
+    بالكامل بلا حساب مسجّل. هذا تنزيل فقط — لا شيء يُنشأ في حساب أحد.
+    """
+    path = os.path.join(WORK, job.id + ".bin")
+    job.state = "downloading"
+    job.stage = "جارٍ الاتصال بميجا…"
+    job.percent = 0
+    started = time.time()
+    try:
+        if mega_up.FAKE:
+            client = mega_up._FakeMega()
+            info = client.get_public_url_info(job.url)
+        else:
+            client = mega_up._import_mega()()
+            info = client.get_public_url_info(job.url)
+    except Exception as e:                                   # noqa: BLE001
+        raise TransientError(f"ميجا: {type(e).__name__}: {e}"[:200])
+    size = int(info.get("size") or 0)
+    if size and size > MAX_MB * 1048576:
+        raise RuntimeError(f"الحجم يتجاوز الحد ({MAX_MB} م.ب)")
+    job.total = size
+    job.filename = _fix_mega_name(info.get("name", ""))
+    job.stage = f"جارٍ التنزيل من ميجا ({job.filename})"
+
+    result: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            result["path"] = str(client.download_url(job.url, WORK, job.id + ".bin"))
+        except Exception as e:                               # noqa: BLE001
+            result["error"] = e
+
+    tmp_dir = tempfile.gettempdir()
+    try:
+        pre_existing = set(glob.glob(os.path.join(tmp_dir, "megapy_*")))
+    except Exception:
+        pre_existing = set()
+    t = threading.Thread(target=runner, name="mega-dl-" + job.id, daemon=True)
+    t.start()
+    # مراقبة الملف المؤقت لتغذية نسبة التقدم (أفضل جهد؛ دقيقة للمهام المفردة)
+    while t.is_alive():
+        try:
+            cands = [c for c in glob.glob(os.path.join(tmp_dir, "megapy_*"))
+                     if c not in pre_existing and os.path.getmtime(c) >= started - 1]
+            if cands and size:
+                got = max(os.path.getsize(c) for c in cands)
+                job.got = min(got, size)
+                job.percent = int(job.got * 100 / size)
+                job.stage = f"تنزيل من ميجا: {job.got // 1048576} من {size // 1048576} م.ب"
+        except Exception:
+            pass
+        time.sleep(0.4)
+    t.join()
+    if "error" in result:
+        e = result["error"]
+        msg = f"{type(e).__name__}: {e}".lower()
+        if any(s in msg for s in ("retrying", "timed out", "timeout", "connection", "reset", "temporarily")):
+            raise TransientError(f"ميجا: {e}"[:200])
+        if "mac" in msg:
+            raise RuntimeError("تعذّر فك تشفير ملف ميجا — الرابط غير مكتمل أو الملف تالف")
+        raise RuntimeError(f"ميجا: {type(e).__name__}: {e}"[:200])
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise TransientError("ميجا أرجع ملفًا فارغًا")
+    job.total = os.path.getsize(path)
+    job.got = job.total
+    return path
+
+
+# ─────────────────── «حل ذكي ✨»: استخراج رابط التنزيل من صفحات الويب ───────────────────
+_DL_WORD = re.compile(r"(download|تحميل|تنزيل|مباشر|direct)", re.I)
+_FILE_EXT = re.compile(r"\.(zip|rar|7z|tar|gz|bz2|pdf|mp3|mp4|m4a|mkv|avi|mov|webm|flv|apk|exe|msi|doc|docx|xls|xlsx|ppt|pptx|iso|img|torrent)(\?|#|$)", re.I)
+_HREF_HINT = re.compile(r"(/download|/dl/|/files?/|export=download|confirm=t|attdownload=1)", re.I)
+_BAD_HOST = re.compile(r"(doubleclick\.net|googleadservices|adservice|adnxs\.com|adsystem|advertising|click\.|track|analytics)", re.I)
+
+
+def _smart_candidates(page_url: str, body: bytes) -> list[str]:
+    """يرشّح أقوى روابط التنزيل في صفحة HTML — مرتبة بالقوة، بلا إعلانات أو صفحات دخول."""
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        raise RuntimeError("مكتبة التحليل (beautifulsoup4) غير مثبتة على السيرفر — أضِفها إلى requirements.txt.")
+    try:
+        soup = BeautifulSoup(body, "html.parser")
+    except Exception:
+        return []
+    seen: set[str] = set()
+    scored: list[tuple[int, str]] = []
+
+    def add(href: str | None, text: str) -> None:
+        if not href:
+            return
+        href = href.strip()
+        if not href or href.startswith(("javascript:", "mailto:", "#", "data:")):
+            return
+        url = urljoin(page_url, href)
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return
+        host = (p.hostname or "").lower()
+        if not _host_is_public(host) or _BAD_HOST.search(host):
+            return
+        score = 0
+        if _FILE_EXT.search(url):
+            score += 3
+        if _HREF_HINT.search(url):
+            score += 2
+        if _DL_WORD.search(text or ""):
+            score += 2
+        if "drive.usercontent.google.com" in url or "dl.dropboxusercontent.com" in url:
+            score += 4
+        if re.search(r"(login|signin|signup|register|auth)", url.lower()):
+            score -= 5
+        if score >= 3 and url not in seen:
+            seen.add(url)
+            scored.append((score, url))
+
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(" ", strip=True)
+        attrs = " ".join(str(v) for v in a.attrs.values() if isinstance(v, str))
+        add(a["href"], f"{text} {attrs}")
+    # <meta http-equiv="refresh" content="0;url=...">
+    meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+    if meta and meta.get("content"):
+        m = re.search(r"url\s*=\s*(.+)$", str(meta["content"]), re.I)
+        if m:
+            add(m.group(1).strip(), "refresh download")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [u for _, u in scored[:3]]
+
+
+class _HtmlPage(Exception):
+    """الاستجابة صفحة HTML — نحمل جسمها لاستخدامه في «الحل الذكي»."""
+
+    def __init__(self, body: bytes):
+        super().__init__("صفحة ويب وليست ملفًا")
+        self.body = (body or b"")[:5 << 20]   # أقصى 5 م.ب للتحليل
+
+
+def _read_capped(resp: Any, limit: int) -> bytes:
+    buf = bytearray()
+    for chunk in resp.iter_bytes(1 << 16):
+        buf += chunk
+        if len(buf) >= limit:
+            break
+    return bytes(buf[:limit])
+
+
 def _guess_name(url: str, cd: str, ct: str) -> str:
     name = ""
     if cd:
@@ -292,28 +496,47 @@ def _clean(name: str) -> str:
     return (name or "file")[:180]
 
 
-def _download(job: Job) -> str:
-    """ينزّل الرابط إلى WORK/{id}.bin ويعيد المسار."""
+def _open_stream(c: httpx.Client, url: str):
+    """يفتح بثّ GET مع تتبع التحويلات يدويًا — كل قفزة تُفحص ضد SSRF."""
+    hops = 0
+    while True:
+        u = urlparse(url)
+        if u.scheme not in ("http", "https") or not _host_is_public((u.hostname or "").lower()):
+            raise RuntimeError("الرابط يحوّل إلى عنوان داخلي غير مسموح")
+        req = c.build_request("GET", url)
+        r = c.send(req, stream=True)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location") or ""
+            r.close()
+            if not loc:
+                raise RuntimeError("إعادة توجيه بلا وجهة")
+            url = urljoin(url, loc)
+            hops += 1
+            if hops > 6:
+                raise TransientError("عدد تحويلات كبير — تعذّر التنزيل")
+            continue
+        return r, url
+
+
+def _stream_to_file(job: Job, url: str) -> str:
+    """يبثّ url إلى WORK/{id}.bin — يرفع _HtmlPage عند جواب HTML."""
     path = os.path.join(WORK, job.id + ".bin")
     job.state = "downloading"
-    job.stage = "جارٍ التنزيل من الرابط"
+    job.stage = "جارٍ التنزيل من الرابط" if not job.resolved_from else "وُجد رابط تحميل — جارٍ تنزيله"
     job.percent = 0
-    final_url = _resolve_url(job.url)
-    if final_url != job.url:
-        job.stage = "حُلّ الرابط إلى تحميل مباشر — جارٍ التنزيل"
+    job.got = 0
     try:
-        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30, read=120),
+        with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(30, read=120),
                           headers={"User-Agent": USER_AGENT}) as c:
-            with c.stream("GET", final_url) as r:
+            r, final_url = _open_stream(c, url)
+            try:
                 if r.status_code >= 400:
                     if r.status_code in (408, 429) or r.status_code >= 500:
                         raise TransientError(f"الرابط رد {r.status_code}")
                     raise RuntimeError(f"الرابط رد {r.status_code}")
-                # روابط الصفحات (Google Drive القديم / Dropbox dl=0 / صفحات معطوبة)
-                # تُرجع HTML وليست ملفًا — نرفضها برسالة واضحة بدل رفع ملف تافه
                 ctype = (r.headers.get("content-type") or "").lower()
                 if "text/html" in ctype:
-                    raise RuntimeError("الرابط أرجع صفحة ويب (HTML) وليست ملفًا — استخدم رابط «تحميل مباشر» للملف")
+                    raise _HtmlPage(_read_capped(r, 5 << 20))
                 job.filename = job.filename or _guess_name(final_url, r.headers.get("content-disposition", ""),
                                                            r.headers.get("content-type", ""))
                 job.total = int(r.headers.get("content-length") or 0)
@@ -326,7 +549,7 @@ def _download(job: Job) -> str:
                         if first:
                             head = chunk[:512].lstrip().lower()
                             if head.startswith((b"<!doctype html", b"<html")):
-                                raise RuntimeError("الرابط أرجع صفحة ويب (HTML) وليست ملفًا — استخدم رابط «تحميل مباشر» للملف")
+                                raise _HtmlPage(bytes(chunk) + _read_capped(r, 5 << 20))
                             first = False
                         fh.write(chunk)
                         got += len(chunk)
@@ -338,6 +561,11 @@ def _download(job: Job) -> str:
                             job.stage = f"تنزيل {got // 1048576} من {job.total // 1048576} م.ب"
                         else:
                             job.stage = f"تنزيل {got // 1048576} م.ب"
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
         if os.path.getsize(path) == 0:
             raise TransientError("الملف المُنزَّل فارغ")
         job.total = os.path.getsize(path)
@@ -350,6 +578,36 @@ def _download(job: Job) -> str:
         except Exception:
             pass
         raise
+
+
+def _download(job: Job) -> str:
+    """التوجيه: mega.nz → تنزيل مباشر · رابط مباشر → بثّ · صفحة ويب → «حل ذكي» عند التفعيل."""
+    if _is_mega_link(job.url):
+        return _mega_public_download(job)
+    final_url = _resolve_url(job.url)
+    if final_url != job.url:
+        job.stage = "حُلّ الرابط إلى تحميل مباشر — جارٍ التنزيل"
+    try:
+        return _stream_to_file(job, final_url)
+    except _HtmlPage as page:
+        if not job.smart:
+            raise RuntimeError("الرابط أرجع صفحة ويب (HTML) وليست ملفًا — فعّل «حل ذكي ✨» للمحاولة تلقائيًا، أو استخدم رابط تحميل مباشر")
+        cands = _smart_candidates(final_url, page.body)
+        if not cands:
+            raise RuntimeError("صفحة ويب بلا رابط تحميل صالح فيها — استخدم رابط تحميل مباشر")
+        last_err: Exception | None = None
+        for cand in cands:
+            job.filename = ""            # اسمح للمرشح الجديد بفرض اسمه
+            job.got = 0
+            job.percent = 0
+            job.resolved_from = job.url
+            try:
+                return _stream_to_file(job, _resolve_url(cand))
+            except _HtmlPage:
+                last_err = RuntimeError(f"{cand[:120]} أرجع صفحة ويب أيضًا")
+            except Exception as e:       # noqa: BLE001
+                last_err = e
+        raise RuntimeError(f"لم ينجح أي رابط في الصفحة: {last_err}"[:300])
 
 
 def _worker(job: Job) -> None:
@@ -405,13 +663,13 @@ def _worker(job: Job) -> None:
             pass
 
 
-def _make_job(owner: str, url: str, sid: str, folder: str) -> Optional[Job]:
+def _make_job(owner: str, url: str, sid: str, folder: str, smart: bool = False) -> Optional[Job]:
     """ينشئ مهمة ويشغّلها في Thread — يعيد None لو بلغنا الحد الأقصى للمهام."""
     folder = (folder or "").strip() or mega_up.FOLDER
     with LOCK:
         if len(JOBS) >= MAX_JOBS:
             return None
-        job = Job(id=uuid.uuid4().hex[:12], owner=owner, url=url, sid=sid, folder=folder)
+        job = Job(id=uuid.uuid4().hex[:12], owner=owner, url=url, sid=sid, folder=folder, smart=bool(smart))
         JOBS[job.id] = job
     threading.Thread(target=_worker, args=(job,), name="deepup-" + job.id, daemon=True).start()
     return job
@@ -421,7 +679,7 @@ def _make_job(owner: str, url: str, sid: str, folder: str) -> Optional[Job]:
 def create_job(req: JobReq, owner: str = Depends(auth)) -> dict:
     _gc()
     _safe_url(req.url.strip())
-    job = _make_job(owner, req.url.strip(), req.session_id, req.folder)
+    job = _make_job(owner, req.url.strip(), req.session_id, req.folder, req.smart)
     if job is None:
         raise HTTPException(429, "عدد المهام كبير — انتظر قليلًا أو احذف مهامًا قديمة")
     return job.dict()
@@ -456,7 +714,7 @@ def create_batch(req: BatchReq, owner: str = Depends(auth)) -> dict:
         except HTTPException as e:
             rejected.append({"url": u, "reason": str(e.detail)})
             continue
-        job = _make_job(owner, u, req.session_id, req.folder)
+        job = _make_job(owner, u, req.session_id, req.folder, req.smart)
         if job is None:
             rejected.append({"url": u, "reason": "بلغت الحد الأقصى للمهام المتزامنة"})
             continue

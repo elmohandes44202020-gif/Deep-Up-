@@ -55,6 +55,11 @@ def _shims() -> None:
 
 def _import_mega() -> Any:
     _shims()
+    # mega.py تجرّ نسخة باك بورت قديمة من pathlib (pathlib-1.0.1) تظلّل مكتبة
+    # بايثون القياسية بعد إدراج _LIB_DIR في sys.path — فنفشل shutil.move بها.
+    # الحل: تثبيت pathlib القياسي في sys.modules قبل أي استيراد من المجلد.
+    import pathlib as _stdlib_pathlib
+    sys.modules.setdefault("pathlib", _stdlib_pathlib)
     try:
         from mega import Mega          # noqa: F401
         _lib_state.update(tried=True, ok=True, error="")
@@ -420,6 +425,15 @@ if FAKE:
 
         def get_folder_link(self, handle):
             return "https://mega.nz/folder/" + str(handle)
+
+        def get_public_url_info(self, url):
+            return {"size": 262144, "name": "ملف-اختبار-ميجا.zip"}
+
+        def download_url(self, url, dest_path=None, dest_filename=None):
+            p = os.path.join(dest_path or ".", dest_filename or "mega.bin")
+            with open(p, "wb") as fh:
+                fh.write(b"MEGAFAKE" * 32768)   # ‏262,144 بايت بالضبط
+            return p
 
     def _fake_session() -> dict:
         return {"client": _FakeMega(), "at": time.time(), "email": "fa***@test", "uploads": 0}
